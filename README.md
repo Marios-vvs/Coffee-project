@@ -1,123 +1,113 @@
 # ☕ Coffee Machine Arbitrage Tracker
 
-A Python tool that scrapes UK auction houses for underpriced premium coffee equipment, matches listings against a reference price database, calculates arbitrage potential, and exports results to a formatted Excel workbook.
+Monitors UK auction sites for premium coffee equipment deals, matches them against a reference price database, calculates arbitrage potential, and exports results to a formatted Excel workbook.
 
-## Strategy
+## How It Works
 
-UK auction houses that handle café closures, restaurant liquidations, and retail returns often sell premium espresso machines at 40-80% below retail. These sites have far less competition than eBay or Facebook Marketplace because:
-- Buyers need to register with the auction house
-- Collection is often required (no shipping)
-- Listings are buried in mixed-category sales
-- The coffee-specific buyer community doesn't monitor these as closely
+1. **Scrape** — Playwright-powered headless browser searches 7 UK auction sites for coffee equipment
+2. **Match** — Listing titles are matched against 80+ premium machines (La Marzocco, Sage, Rocket, ECM, Jura, Mazzer, etc.)
+3. **Calculate** — Arbitrage metrics: discount %, gross potential, conservative resale estimate, net profit
+4. **Export** — Colour-coded Excel workbook with deal ratings (🔥 Strong Buy / ✅ Good Deal / ⚠️ Fair / ❌ Overpriced)
 
-This tool automates the monitoring so you can bid on the best deals before they close.
+## Auction Sources
 
-## Target Sites
+| Site | Type | Best For |
+|------|------|----------|
+| John Pye | Timed online | Retail returns, ex-display |
+| i-bidder | Aggregator | Hundreds of UK auction houses |
+| Bidspotter | Commercial | Café closures, restaurant liquidation |
+| BPI Auctions | Specialist | Catering/industrial liquidation |
+| Pro Auction | Specialist | London/SE café clearances |
+| Wilsons Auctions | General | Government surplus, police seizures |
+| Auction News | Meta-source | Upcoming catering auctions |
 
-| Site | Type | Why It's Good |
-|------|------|---------------|
-| **John Pye** | UK's largest commercial auctioneer | Retail returns from major retailers, ex-display stock |
-| **i-bidder** | Auction aggregator (100s of houses) | Aggregates Ramco, EAMA, and many smaller auctioneers |
-| **Bidspotter** | Industrial/commercial aggregator | Pro Auction, Robson Kay — specialist café clearances |
-| **BPI Auctions** | Business liquidation specialist | Catering equipment from insolvency/closures |
-| **Pro Auction** | Restaurant/café clearance specialist | Often handles complete London café closures |
-| **Wilsons Auctions** | Largest independent UK/Ireland | Government surplus, police seizures, insolvency |
-| **Auction News** | Meta-aggregator | Lists upcoming catering sales across all houses |
+## Setup
 
-## Architecture
+### Prerequisites
+- Python 3.10+
+- Chromium (installed via Playwright)
 
+### Installation
+
+```bash
+# Clone and enter
+git clone https://github.com/Marios-vvs/Coffee-project.git
+cd Coffee-project
+
+# Create virtual environment
+python3 -m venv venv
+source venv/bin/activate        # Mac/Linux
+# venv\Scripts\activate         # Windows PowerShell
+
+# Install dependencies
+pip install -r requirements.txt
+
+# Install headless Chromium (required for scraping)
+playwright install chromium
 ```
-┌─────────────────────────────────────────────────────┐
-│                    main.py                          │
-│  Orchestrator: scrape → match → enrich → export     │
-└─────────┬───────────────────────────────┬───────────┘
-          │                               │
-          ▼                               ▼
-┌──────────────────┐          ┌──────────────────────┐
-│   scrapers.py    │          │  reference_prices.py  │
-│                  │          │                        │
-│ • JohnPyeScraper │          │ • 80+ premium machines │
-│ • IBidderScraper │──match──▶│ • Brand/model/retail £ │
-│ • BidspotterScrp │          │ • Arbitrage calculator  │
-│ • BPIAuctions    │          │ • Keyword matching      │
-│ • ProAuction     │          └──────────────────────┘
-│ • WilsonsAuction │                    │
-│ • AuctionNews    │                    ▼
-└──────────────────┘          ┌──────────────────────┐
-                              │   excel_export.py     │
-                              │                        │
-                              │ • Deals Dashboard      │
-                              │ • Reference Prices     │
-                              │ • Scrape Log           │
-                              └──────────────────────┘
+
+### Windows Note
+If PowerShell blocks the venv activation, run this first:
+```powershell
+Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser
 ```
 
 ## Usage
 
 ```bash
-# One-off run: scrape all sites, export Excel
+# Run once — scrape all sites, export to Excel
 python main.py
 
-# Scheduled mode: runs at 09:00 and 21:00 daily
-python main.py --schedule
-
-# Test with mock data (verify Excel formatting)
+# Quick test with mock data (no scraping)
 python main.py --test
+
+# Scheduled mode — runs at 09:00 and 21:00 daily
+python main.py --schedule
 ```
 
-## Output
+Output: `coffee_deals_YYYYMMDD_HHMMSS.xlsx` in the current directory.
 
-The Excel workbook contains three sheets:
+## Project Structure
 
-1. **☕ Deals Dashboard** — All matched listings sorted by opportunity
-   - Rating: 🔥 STRONG BUY (60%+) / ✅ GOOD DEAL (40-60%) / ⚠️ FAIR / ❌ OVERPRICED
-   - Current bid vs retail price
-   - Conservative profit estimate (assumes 65% of retail resale)
-   - Direct links to auction lots
+```
+Coffee-project/
+├── main.py                 # Entry point — orchestrates the pipeline
+├── scrapers.py             # Playwright-powered auction site scrapers
+├── reference_prices.py     # Price database (80+ machines) + matching engine
+├── excel_export.py         # Formatted Excel workbook export
+├── requirements.txt        # Python dependencies
+└── README.md
+```
 
-2. **📊 Reference Prices** — Full database of 80+ premium machines with retail prices
+## Architecture Notes
 
-3. **📋 Scrape Log** — Metadata, stats, and source breakdown
+**Why Playwright instead of requests?**
+UK auction sites (John Pye, i-bidder, Bidspotter, etc.) use Cloudflare and JS-based bot detection. Raw HTTP requests get 403 Forbidden. Playwright runs a real headless Chromium browser that renders JavaScript, passes bot checks, and loads dynamic content. If Playwright isn't installed, the scrapers fall back to raw requests but most sites will block them.
 
-## Adding New Machines
+**Tuning CSS selectors:**
+The CSS selectors in each scraper are best-effort based on common patterns. Auction sites change their HTML frequently. If a scraper stops finding results:
+1. Open the site in Chrome
+2. Right-click a listing → Inspect
+3. Update the selectors in the relevant scraper class
 
-Edit `reference_prices.py` and add entries to `REFERENCE_MACHINES`:
-
+**Adding new machines:**
+Edit `reference_prices.py` → `REFERENCE_MACHINES` dict. Format:
 ```python
-"brand model keywords": {
-    "brand": "Brand Name",
+"search key lowercase": {
+    "brand": "Display Name",
     "model": "Model Name",
-    "retail_gbp": 1500,
-    "category": "prosumer"  # or "commercial_single" or "commercial_multi"
+    "retail_gbp": 1234,
+    "category": "prosumer"  # or "commercial_single" / "commercial_multi"
 }
 ```
 
-## Adding New Auction Sites
+## Rating System
 
-Create a new class in `scrapers.py` that extends `BaseScraper`:
+| Rating | Discount | Meaning |
+|--------|----------|---------|
+| 🔥 STRONG BUY | 60%+ | Exceptional deal — act fast |
+| ✅ GOOD DEAL | 40–60% | Worth bidding |
+| ⚠️ FAIR | 20–40% | Marginal opportunity |
+| ❌ OVERPRICED | <20% | Skip |
 
-```python
-class MyNewScraper(BaseScraper):
-    name = "My Auction Site"
-    base_url = "https://..."
-
-    def scrape(self) -> list[AuctionListing]:
-        # Fetch, parse, return listings
-        ...
-```
-
-Then add it to `ALL_SCRAPERS` at the bottom of the file.
-
-## Important Notes
-
-- **Scraping is fragile.** Auction sites change their HTML structure. When a scraper breaks, check the CSS selectors in that scraper class.
-- **Be polite.** The scrapers include 1-1.5 second delays between requests. Don't reduce these.
-- **Collection logistics matter.** Factor in travel/shipping costs when evaluating deals. A £200 saving isn't worth a 400-mile round trip.
-- **VAT/Buyer's Premium.** Most auction houses charge 15-25% buyer's premium on top of the hammer price. Factor this into your calculations.
-- **Test before you rely on it.** Run with `--test` first to verify the Excel output looks right.
-
-## Dependencies
-
-```
-pip install requests beautifulsoup4 openpyxl schedule
-```
+Conservative resale assumes 65% of retail price for refurbished equipment.

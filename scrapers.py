@@ -2,6 +2,9 @@
 Coffee Machine Auction Scraper
 Scrapes UK auction houses for premium coffee equipment deals.
 Targets low-competition liquidation/auction sites, NOT eBay/Amazon.
+
+Uses Playwright (headless Chromium) to bypass bot detection.
+Falls back to raw requests if Playwright is unavailable.
 """
 
 import requests
@@ -14,15 +17,23 @@ from datetime import datetime, timezone
 from dataclasses import dataclass, field, asdict
 from typing import Optional
 
+# Try to import Playwright; flag availability
+try:
+    from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
+    PLAYWRIGHT_AVAILABLE = True
+except ImportError:
+    PLAYWRIGHT_AVAILABLE = False
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 logger = logging.getLogger("scraper")
 
-# Common headers to avoid bot detection
+# Common headers for the requests fallback
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "en-GB,en;q=0.9",
 }
+
 
 @dataclass
 class AuctionListing:
@@ -44,26 +55,105 @@ class AuctionListing:
 
 
 class BaseScraper:
-    """Base class for auction site scrapers."""
+    """
+    Base class for auction site scrapers.
+
+    Uses Playwright (headless Chromium) as primary fetch method to bypass
+    anti-bot protections (Cloudflare, JS challenges, etc.). Falls back to
+    raw requests if Playwright is not installed.
+    """
     name = "base"
     base_url = ""
 
     def __init__(self):
         self.session = requests.Session()
         self.session.headers.update(HEADERS)
+        self._playwright = None
+        self._browser = None
 
-    def fetch(self, url: str, params: dict = None) -> Optional[BeautifulSoup]:
-        """Fetch a page and return parsed soup."""
+    def _get_browser(self):
+        """Lazily launch Playwright browser (reused across fetches)."""
+        if not PLAYWRIGHT_AVAILABLE:
+            return None
+        if self._browser is None:
+            self._playwright = sync_playwright().start()
+            self._browser = self._playwright.chromium.launch(
+                headless=True,
+                args=["--disable-blink-features=AutomationControlled"],
+            )
+        return self._browser
+
+    def close(self):
+        """Clean up browser resources. Call when done scraping."""
+        if self._browser:
+            self._browser.close()
+            self._browser = None
+        if self._playwright:
+            self._playwright.stop()
+            self._playwright = None
+
+    def fetch(self, url: str, params: dict = None, wait_selector: str = None) -> Optional[BeautifulSoup]:
+        """
+        Fetch a page and return parsed BeautifulSoup.
+
+        Primary: Playwright headless browser (bypasses JS/Cloudflare).
+        Fallback: raw requests (works for simpler sites).
+        """
+        # Build full URL with params
+        if params:
+            from urllib.parse import urlencode
+            url = f"{url}?{urlencode(params)}"
+
+        # Try Playwright first
+        browser = self._get_browser()
+        if browser:
+            try:
+                context = browser.new_context(
+                    user_agent=HEADERS["User-Agent"],
+                    viewport={"width": 1920, "height": 1080},
+                    locale="en-GB",
+                )
+                page = context.new_page()
+
+                # Block images/fonts/media to speed up loading
+                page.route("**/*.{png,jpg,jpeg,gif,svg,webp,woff,woff2,ttf,mp4,mp3}", lambda route: route.abort())
+
+                page.goto(url, wait_until="domcontentloaded", timeout=30000)
+
+                # Wait for a specific selector if provided, otherwise wait for network idle
+                if wait_selector:
+                    try:
+                        page.wait_for_selector(wait_selector, timeout=10000)
+                    except PlaywrightTimeout:
+                        logger.debug(f"[{self.name}] Selector '{wait_selector}' not found, continuing with page as-is")
+                else:
+                    try:
+                        page.wait_for_load_state("networkidle", timeout=15000)
+                    except PlaywrightTimeout:
+                        pass  # Page loaded enough, continue
+
+                html = page.content()
+                context.close()
+                return BeautifulSoup(html, "html.parser")
+
+            except Exception as e:
+                logger.warning(f"[{self.name}] Playwright fetch failed for {url}: {e}")
+                try:
+                    context.close()
+                except Exception:
+                    pass
+
+        # Fallback to requests
         try:
-            resp = self.session.get(url, params=params, timeout=30)
+            resp = self.session.get(url, timeout=30)
             resp.raise_for_status()
             return BeautifulSoup(resp.text, "html.parser")
         except requests.RequestException as e:
-            logger.error(f"[{self.name}] Failed to fetch {url}: {e}")
+            logger.error(f"[{self.name}] Requests fallback also failed for {url}: {e}")
             return None
 
     def fetch_json(self, url: str, params: dict = None) -> Optional[dict]:
-        """Fetch JSON endpoint."""
+        """Fetch JSON endpoint (uses requests — no browser needed)."""
         try:
             resp = self.session.get(url, params=params, timeout=30)
             resp.raise_for_status()
@@ -80,7 +170,6 @@ class BaseScraper:
         """Extract a numeric price from text like '£150.00' or 'GBP 150'."""
         if not text:
             return None
-        # Remove currency symbols and common text
         cleaned = re.sub(r'[£$€,]', '', text)
         cleaned = re.sub(r'(gbp|eur|usd|vat|inc|ex|starting|current|bid)', '', cleaned, flags=re.IGNORECASE)
         match = re.search(r'(\d+(?:\.\d{1,2})?)', cleaned.strip())
@@ -92,15 +181,11 @@ class BaseScraper:
 class JohnPyeScraper(BaseScraper):
     """
     John Pye Auctions - UK's largest commercial auction house.
-    They run timed online auctions with retail returns, ex-display,
-    liquidation stock. Coffee machines appear in appliance/kitchen sales.
-    
-    Strategy: Search their API/site for coffee machine keywords.
+    Timed online auctions: retail returns, ex-display, liquidation stock.
     """
     name = "John Pye"
     base_url = "https://www.johnpyeauctions.co.uk"
 
-    # Search keywords that catch premium machines
     SEARCH_TERMS = [
         "coffee machine", "espresso machine", "sage barista", "delonghi specialista",
         "la marzocco", "jura", "sage oracle", "coffee grinder",
@@ -111,14 +196,16 @@ class JohnPyeScraper(BaseScraper):
         listings = []
         for term in self.SEARCH_TERMS:
             logger.info(f"[{self.name}] Searching: {term}")
-            soup = self.fetch(f"{self.base_url}/Search", params={"q": term})
+            soup = self.fetch(
+                f"{self.base_url}/Search",
+                params={"q": term},
+                wait_selector=".lot-card, .search-result-item, [class*='lot']",
+            )
             if not soup:
                 continue
 
-            # John Pye uses a card-based layout for search results
             lot_cards = soup.select(".lot-card, .search-result-item, .lot-item, [class*='lot'], [class*='auction-item']")
             if not lot_cards:
-                # Fallback: look for any links containing lot details
                 lot_cards = soup.select("a[href*='LotDetails'], a[href*='lotdetails']")
 
             for card in lot_cards:
@@ -150,8 +237,9 @@ class JohnPyeScraper(BaseScraper):
                     logger.debug(f"[{self.name}] Error parsing card: {e}")
                     continue
 
-            time.sleep(1)  # Be polite
+            time.sleep(1)
 
+        self.close()
         logger.info(f"[{self.name}] Found {len(listings)} listings")
         return listings
 
@@ -159,10 +247,7 @@ class JohnPyeScraper(BaseScraper):
 class IBidderScraper(BaseScraper):
     """
     i-bidder.com (also powers the-saleroom.com)
-    Major UK auction aggregator. Hosts auctions for hundreds of UK auction houses
-    including Ramco, Pro Auction, EAMA, etc.
-    
-    Their search endpoint lets us query across ALL participating auction houses at once.
+    Major UK auction aggregator — searches across hundreds of auction houses.
     """
     name = "i-bidder"
     base_url = "https://www.i-bidder.com"
@@ -177,14 +262,16 @@ class IBidderScraper(BaseScraper):
         listings = []
         for term in self.SEARCH_TERMS:
             logger.info(f"[{self.name}] Searching: {term}")
-            soup = self.fetch(f"{self.base_url}/en-gb/search", params={"query": term})
+            soup = self.fetch(
+                f"{self.base_url}/en-gb/search",
+                params={"query": term},
+                wait_selector=".lot-tile, .search-lot, [class*='lot-card']",
+            )
             if not soup:
                 continue
 
-            # i-bidder uses lot-card or similar elements
             lot_cards = soup.select(".lot-tile, .search-lot, [class*='lot-card'], .lot-result, .lot")
             if not lot_cards:
-                # Try broader selectors
                 lot_cards = soup.select("a[href*='/lot/'], a[href*='auction-catalogues']")
 
             for card in lot_cards:
@@ -201,7 +288,6 @@ class IBidderScraper(BaseScraper):
                     price_el = card.select_one(".current-bid, .price, .hammer-price, [class*='price'], [class*='bid']")
                     price = self._parse_price(price_el.get_text()) if price_el else None
 
-                    # i-bidder often shows RRP
                     rrp_el = card.select_one(".rrp, .retail-price, [class*='rrp']")
                     rrp = self._parse_price(rrp_el.get_text()) if rrp_el else None
 
@@ -231,6 +317,7 @@ class IBidderScraper(BaseScraper):
 
             time.sleep(1.5)
 
+        self.close()
         logger.info(f"[{self.name}] Found {len(listings)} listings")
         return listings
 
@@ -253,7 +340,11 @@ class BidspotterScraper(BaseScraper):
         listings = []
         for term in self.SEARCH_TERMS:
             logger.info(f"[{self.name}] Searching: {term}")
-            soup = self.fetch(f"{self.base_url}/en-gb/search", params={"q": term})
+            soup = self.fetch(
+                f"{self.base_url}/en-gb/search",
+                params={"q": term},
+                wait_selector=".lot-card, .lot-tile, [class*='lot-item']",
+            )
             if not soup:
                 continue
 
@@ -288,6 +379,7 @@ class BidspotterScraper(BaseScraper):
 
             time.sleep(1)
 
+        self.close()
         logger.info(f"[{self.name}] Found {len(listings)} listings")
         return listings
 
@@ -308,7 +400,11 @@ class BPIAuctionsScraper(BaseScraper):
         listings = []
         for term in self.SEARCH_TERMS:
             logger.info(f"[{self.name}] Searching: {term}")
-            soup = self.fetch(f"{self.base_url}/search", params={"q": term})
+            soup = self.fetch(
+                f"{self.base_url}/search",
+                params={"q": term},
+                wait_selector=".lot, .auction-lot, [class*='lot']",
+            )
             if not soup:
                 continue
 
@@ -345,6 +441,7 @@ class BPIAuctionsScraper(BaseScraper):
 
             time.sleep(1)
 
+        self.close()
         logger.info(f"[{self.name}] Found {len(listings)} listings")
         return listings
 
@@ -353,7 +450,6 @@ class ProAuctionScraper(BaseScraper):
     """
     Pro Auction Limited - specialist in restaurant/café clearances.
     Often handle complete café closures in London and SE England.
-    Listed on Bidspotter but also have their own catalogue pages.
     """
     name = "Pro Auction"
     base_url = "https://www.proauction.ltd.uk"
@@ -362,13 +458,11 @@ class ProAuctionScraper(BaseScraper):
         listings = []
         logger.info(f"[{self.name}] Checking current auctions...")
 
-        # Pro Auction often lists current sales on their homepage / sales page
         for path in ["/current-sales", "/auctions", "/sales", "/"]:
             soup = self.fetch(f"{self.base_url}{path}")
             if not soup:
                 continue
 
-            # Look for any links to auction catalogues or lot pages
             auction_links = soup.select("a[href*='auction'], a[href*='sale'], a[href*='lot'], a[href*='catalogue']")
             for link in auction_links:
                 text = link.get_text(strip=True).lower()
@@ -383,6 +477,7 @@ class ProAuctionScraper(BaseScraper):
                     ))
             time.sleep(1)
 
+        self.close()
         logger.info(f"[{self.name}] Found {len(listings)} listings")
         return listings
 
@@ -401,7 +496,11 @@ class WilsonsAuctionsScraper(BaseScraper):
         listings = []
         for term in self.SEARCH_TERMS:
             logger.info(f"[{self.name}] Searching: {term}")
-            soup = self.fetch(f"{self.base_url}/search", params={"q": term})
+            soup = self.fetch(
+                f"{self.base_url}/search",
+                params={"q": term},
+                wait_selector=".lot, [class*='lot'], .auction-item",
+            )
             if not soup:
                 continue
 
@@ -433,14 +532,15 @@ class WilsonsAuctionsScraper(BaseScraper):
 
             time.sleep(1)
 
+        self.close()
         logger.info(f"[{self.name}] Found {len(listings)} listings")
         return listings
 
 
 class AuctionNewsScraper(BaseScraper):
     """
-    AuctionNews.com - aggregator that lists upcoming catering equipment auctions
-    from multiple UK auction houses. Good meta-source to find sales we might miss.
+    AuctionNews.com - aggregator that lists upcoming catering equipment auctions.
+    Good meta-source to find sales we might miss.
     """
     name = "Auction News"
     base_url = "https://auctionnews.com"
@@ -451,6 +551,7 @@ class AuctionNewsScraper(BaseScraper):
 
         soup = self.fetch(f"{self.base_url}/categories/food-industry-auctions/catering-equipment-auctions")
         if not soup:
+            self.close()
             return listings
 
         auction_cards = soup.select(".auction-card, .listing, article, [class*='auction']")
@@ -477,6 +578,7 @@ class AuctionNewsScraper(BaseScraper):
                 logger.debug(f"[{self.name}] Error parsing card: {e}")
                 continue
 
+        self.close()
         logger.info(f"[{self.name}] Found {len(listings)} listings")
         return listings
 
@@ -495,6 +597,13 @@ ALL_SCRAPERS = [
 
 def run_all_scrapers() -> list[AuctionListing]:
     """Run all scrapers and return combined results."""
+    if not PLAYWRIGHT_AVAILABLE:
+        logger.warning(
+            "Playwright not installed — falling back to raw requests. "
+            "Most auction sites will block this. Install with: "
+            "pip install playwright && playwright install chromium"
+        )
+
     all_listings = []
     for scraper_cls in ALL_SCRAPERS:
         try:
@@ -508,6 +617,7 @@ def run_all_scrapers() -> list[AuctionListing]:
 
 if __name__ == "__main__":
     print("Running all scrapers...")
+    print(f"Playwright available: {PLAYWRIGHT_AVAILABLE}")
     listings = run_all_scrapers()
     print(f"\nTotal listings found: {len(listings)}")
     for l in listings[:10]:
